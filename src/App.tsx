@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { ContactShadows, Line, OrbitControls, Text } from '@react-three/drei';
+import { MarchingCubes } from 'three/addons/objects/MarchingCubes.js';
 import * as THREE from 'three';
 
 type DisplayMode = 'cartoon' | 'surface' | 'atoms';
@@ -31,11 +32,58 @@ function Ligand({ rotation, selectedAtom, onSelect }: { rotation: number; select
   const positions = useMemo(() => Object.fromEntries(ligandAtoms.map(atom => [atom.id, new THREE.Vector3(atom.x, atom.y, atom.z)])), []);
   return <group position={[.1, .45, .15]} rotation={[0, rotation, 0]}>{bonds.map(([from, to]) => <Line key={`${from}-${to}`} points={makeBond(positions[from], positions[to])} color="#cbd9dc" lineWidth={3} />)}{ligandAtoms.map(atom => <mesh key={atom.id} position={[atom.x, atom.y, atom.z]} onClick={(event) => { event.stopPropagation(); onSelect(atom.id); }}><sphereGeometry args={[atom.radius * (selectedAtom === atom.id ? 1.35 : 1), 16, 12]} /><meshStandardMaterial color={atom.color} emissive={selectedAtom === atom.id ? atom.color : '#000000'} emissiveIntensity={selectedAtom === atom.id ? .7 : 0} /></mesh>)}</group>;
 }
+// ---- 分子表面（Marching Cubes 隐式场）---------------------------------------
+// MarchingCubes 在局部 [-1, 1] 的立方体内生成等值面，网格缩放后映射到世界坐标。
+const SURFACE_SCALE = 4.2;
+const SURFACE_RESOLUTION = 64;
+const SURFACE_SUBTRACT = 12;
+const SURFACE_BALL_STRENGTH = .35;
+const SURFACE_POCKET_STRENGTH = 1.35;
+function populateSurfaceField(effect: MarchingCubes) {
+  effect.reset();
+  // 世界坐标 -> MarchingCubes 单元立方体 [0, 1] 坐标
+  const toUnit = (p: THREE.Vector3) => [
+    p.x / (2 * SURFACE_SCALE) + .5,
+    p.y / (2 * SURFACE_SCALE) + .5,
+    p.z / (2 * SURFACE_SCALE) + .5
+  ] as const;
+  const addTrail = (points: THREE.Vector3[], hex: string) => {
+    const color = new THREE.Color(hex);
+    for (const point of points) {
+      const [x, y, z] = toUnit(point);
+      effect.addBall(x, y, z, SURFACE_BALL_STRENGTH, SURFACE_SUBTRACT, color);
+    }
+  };
+  // 二级结构骨架在表面上保留各自的颜色区域
+  addTrail(helixPoints, '#6f9fe0');
+  addTrail(sheetPoints, '#c986c2');
+  // 结合口袋以关键残基颜色形成独立的膨大区
+  for (const residue of residues) {
+    const [x, y, z] = toUnit(new THREE.Vector3(residue.x, residue.y, residue.z));
+    effect.addBall(x, y, z, SURFACE_POCKET_STRENGTH, SURFACE_SUBTRACT, new THREE.Color(residue.color));
+  }
+  effect.update();
+}
+function ProteinSurface() {
+  const object = useMemo(() => {
+    const material = new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, opacity: .52, roughness: .38, metalness: .18, side: THREE.DoubleSide });
+    const effect = new MarchingCubes(SURFACE_RESOLUTION, material, false, true, 40000);
+    effect.isolation = 80;
+    populateSurfaceField(effect);
+    effect.scale.setScalar(SURFACE_SCALE);
+    // 表面不参与拾取：点击始终穿透到内部的残基/配体原子
+    effect.raycast = () => undefined;
+    return effect;
+  }, []);
+  useEffect(() => () => { object.geometry.dispose(); (object.material as THREE.Material).dispose(); }, [object]);
+  return <primitive object={object} />;
+}
+
 function ProteinModel({ displayMode, selectedResidue, setSelectedResidue, ligandRotation, selectedAtom, setSelectedAtom }: { displayMode: DisplayMode; selectedResidue: number; setSelectedResidue: (id: number) => void; ligandRotation: number; selectedAtom: string; setSelectedAtom: (id: string) => void }) {
   const showAtoms = displayMode === 'atoms';
   const surface = displayMode === 'surface';
   return <Canvas shadows camera={{ position: [8, 5.5, 9], fov: 40 }}><color attach="background" args={['#09151d']} /><ambientLight intensity={1.2} /><directionalLight position={[5, 8, 5]} intensity={2.4} castShadow /><pointLight position={[-4, 3, 3]} color="#7fe0ff" intensity={18} distance={11} />
-    <group rotation={[.08, -.25, 0]}>{!showAtoms && <><Line points={helixPoints} color="#6b9fe9" lineWidth={surface ? 12 : 5} /> <Line points={sheetPoints} color="#d58acb" lineWidth={surface ? 13 : 6} /></>}{showAtoms && residues.map(residue => <mesh key={residue.id} position={[residue.x, residue.y, residue.z]}><sphereGeometry args={[.22, 12, 10]} /><meshStandardMaterial color={residue.color} /></mesh>)}{residues.map(residue => <group key={`res-${residue.id}`} position={[residue.x, residue.y, residue.z]}><mesh onClick={(event) => { event.stopPropagation(); setSelectedResidue(residue.id); }}><sphereGeometry args={[selectedResidue === residue.id ? .28 : .18, 16, 12]} /><meshStandardMaterial color={residue.color} emissive={selectedResidue === residue.id ? residue.color : '#000'} emissiveIntensity={selectedResidue === residue.id ? .8 : 0} transparent opacity={surface ? .9 : 1} /></mesh><Text position={[0, .43, 0]} fontSize={.14} color={selectedResidue === residue.id ? '#ffe9a2' : '#8baeb9'} anchorX="center">{residue.code}</Text></group>)}<Ligand rotation={ligandRotation} selectedAtom={selectedAtom} onSelect={setSelectedAtom} /></group><ContactShadows position={[0, -1.5, 0]} opacity={.32} scale={10} blur={2.5} /><OrbitControls makeDefault minDistance={5} maxDistance={16} /></Canvas>;
+    <group rotation={[.08, -.25, 0]}>{displayMode === 'cartoon' && <><Line points={helixPoints} color="#6b9fe9" lineWidth={5} /> <Line points={sheetPoints} color="#d58acb" lineWidth={6} /></>}{surface && <ProteinSurface />}{showAtoms && residues.map(residue => <mesh key={residue.id} position={[residue.x, residue.y, residue.z]}><sphereGeometry args={[.22, 12, 10]} /><meshStandardMaterial color={residue.color} /></mesh>)}{residues.map(residue => <group key={`res-${residue.id}`} position={[residue.x, residue.y, residue.z]}><mesh onClick={(event) => { event.stopPropagation(); setSelectedResidue(residue.id); }}><sphereGeometry args={[selectedResidue === residue.id ? .28 : .18, 16, 12]} /><meshStandardMaterial color={residue.color} emissive={selectedResidue === residue.id ? residue.color : '#000'} emissiveIntensity={selectedResidue === residue.id ? .8 : 0} transparent={surface} opacity={surface ? .95 : 1} /></mesh><Text position={[0, .43, 0]} fontSize={.14} color={selectedResidue === residue.id ? '#ffe9a2' : '#8baeb9'} anchorX="center">{residue.code}</Text></group>)}<Ligand rotation={ligandRotation} selectedAtom={selectedAtom} onSelect={setSelectedAtom} /></group><ContactShadows position={[0, -1.5, 0]} opacity={.32} scale={10} blur={2.5} /><OrbitControls makeDefault minDistance={5} maxDistance={16} /></Canvas>;
 }
 function Metric({ label, value, note }: { label: string; value: string; note: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>; }
 export default function App() {
