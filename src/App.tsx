@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { ContactShadows, Line, OrbitControls, Text } from '@react-three/drei';
 import * as THREE from 'three';
+import { MarchingCubes } from 'three/examples/jsm/objects/MarchingCubes.js';
 
 type DisplayMode = 'cartoon' | 'surface' | 'atoms';
 type Residue = { id: number; code: string; name: string; x: number; y: number; z: number; color: string; role: 'active' | 'support' | 'loop' };
@@ -31,11 +32,67 @@ function Ligand({ rotation, selectedAtom, onSelect }: { rotation: number; select
   const positions = useMemo(() => Object.fromEntries(ligandAtoms.map(atom => [atom.id, new THREE.Vector3(atom.x, atom.y, atom.z)])), []);
   return <group position={[.1, .45, .15]} rotation={[0, rotation, 0]}>{bonds.map(([from, to]) => <Line key={`${from}-${to}`} points={makeBond(positions[from], positions[to])} color="#cbd9dc" lineWidth={3} />)}{ligandAtoms.map(atom => <mesh key={atom.id} position={[atom.x, atom.y, atom.z]} onClick={(event) => { event.stopPropagation(); onSelect(atom.id); }}><sphereGeometry args={[atom.radius * (selectedAtom === atom.id ? 1.35 : 1), 16, 12]} /><meshStandardMaterial color={atom.color} emissive={selectedAtom === atom.id ? atom.color : '#000000'} emissiveIntensity={selectedAtom === atom.id ? .7 : 0} /></mesh>)}</group>;
 }
+function ProteinSurface() {
+  // Marching cubes 场域：内部坐标 [0,1] 映射到以 SURFACE_CENTER 为中心、边长 2*SURFACE_SCALE 的世界区域
+  const SURFACE_SCALE = 4;
+  const SURFACE_CENTER: [number, number, number] = [0, .25, 0];
+  const RESOLUTION = 144;
+  const MAX_POLY_COUNT = 180000;
+  // 等值面世界半径 R（Å）→ addBall 强度：iso=80、subtract=12 时 strength = (92/(2·SCALE)²)·R²
+  const ballStrength = (worldRadius: number) => (92 / (4 * SURFACE_SCALE * SURFACE_SCALE)) * worldRadius * worldRadius;
+  const surfaceBalls = useMemo(() => {
+    type SurfaceBall = { x: number; y: number; z: number; radius: number; color: THREE.Color };
+    const balls: SurfaceBall[] = [];
+    const backbone: { point: THREE.Vector3; color: THREE.Color }[] = [];
+    const addBackbone = (points: THREE.Vector3[], radius: number, hex: string) => {
+      const color = new THREE.Color(hex);
+      points.forEach(point => {
+        backbone.push({ point, color });
+        balls.push({ x: point.x, y: point.y, z: point.z, radius, color });
+      });
+    };
+    addBackbone(helixPoints, .26, '#6b9fe9');
+    addBackbone(sheetPoints, .3, '#d58acb');
+    residues.forEach(residue => {
+      const residueColor = new THREE.Color(residue.color);
+      const end = new THREE.Vector3(residue.x, residue.y, residue.z);
+      let anchor = backbone[0];
+      let anchorDistance = Infinity;
+      backbone.forEach(item => { const distance = item.point.distanceTo(end); if (distance < anchorDistance) { anchorDistance = distance; anchor = item; } });
+      const steps = 4;
+      const mixed = new THREE.Color();
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const position = anchor.point.clone().lerp(end, t);
+        mixed.copy(anchor.color).lerp(residueColor, t);
+        balls.push({ x: position.x, y: position.y, z: position.z, radius: i === steps ? .38 : .22, color: mixed.clone() });
+      }
+    });
+    return balls;
+  }, []);
+  const mesh = useMemo(() => {
+    const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, transparent: true, opacity: .62, roughness: .28, metalness: .04, clearcoat: .5, clearcoatRoughness: .35, side: THREE.DoubleSide });
+    const marchingCubes = new MarchingCubes(RESOLUTION, material, false, true, MAX_POLY_COUNT);
+    marchingCubes.reset();
+    surfaceBalls.forEach(ball => {
+      marchingCubes.addBall(.5 + (ball.x - SURFACE_CENTER[0]) / (2 * SURFACE_SCALE), .5 + (ball.y - SURFACE_CENTER[1]) / (2 * SURFACE_SCALE), .5 + (ball.z - SURFACE_CENTER[2]) / (2 * SURFACE_SCALE), ballStrength(ball.radius), 12, ball.color);
+    });
+    marchingCubes.update();
+    marchingCubes.position.set(...SURFACE_CENTER);
+    marchingCubes.scale.setScalar(SURFACE_SCALE);
+    marchingCubes.frustumCulled = false;
+    // 表面不拦截指针事件，残基/配体点击选择可穿透
+    marchingCubes.raycast = () => {};
+    return marchingCubes;
+  }, [surfaceBalls]);
+  useEffect(() => () => { mesh.geometry.dispose(); (mesh.material as THREE.Material).dispose(); }, [mesh]);
+  return <primitive object={mesh} />;
+}
 function ProteinModel({ displayMode, selectedResidue, setSelectedResidue, ligandRotation, selectedAtom, setSelectedAtom }: { displayMode: DisplayMode; selectedResidue: number; setSelectedResidue: (id: number) => void; ligandRotation: number; selectedAtom: string; setSelectedAtom: (id: string) => void }) {
   const showAtoms = displayMode === 'atoms';
   const surface = displayMode === 'surface';
   return <Canvas shadows camera={{ position: [8, 5.5, 9], fov: 40 }}><color attach="background" args={['#09151d']} /><ambientLight intensity={1.2} /><directionalLight position={[5, 8, 5]} intensity={2.4} castShadow /><pointLight position={[-4, 3, 3]} color="#7fe0ff" intensity={18} distance={11} />
-    <group rotation={[.08, -.25, 0]}>{!showAtoms && <><Line points={helixPoints} color="#6b9fe9" lineWidth={surface ? 12 : 5} /> <Line points={sheetPoints} color="#d58acb" lineWidth={surface ? 13 : 6} /></>}{showAtoms && residues.map(residue => <mesh key={residue.id} position={[residue.x, residue.y, residue.z]}><sphereGeometry args={[.22, 12, 10]} /><meshStandardMaterial color={residue.color} /></mesh>)}{residues.map(residue => <group key={`res-${residue.id}`} position={[residue.x, residue.y, residue.z]}><mesh onClick={(event) => { event.stopPropagation(); setSelectedResidue(residue.id); }}><sphereGeometry args={[selectedResidue === residue.id ? .28 : .18, 16, 12]} /><meshStandardMaterial color={residue.color} emissive={selectedResidue === residue.id ? residue.color : '#000'} emissiveIntensity={selectedResidue === residue.id ? .8 : 0} transparent opacity={surface ? .9 : 1} /></mesh><Text position={[0, .43, 0]} fontSize={.14} color={selectedResidue === residue.id ? '#ffe9a2' : '#8baeb9'} anchorX="center">{residue.code}</Text></group>)}<Ligand rotation={ligandRotation} selectedAtom={selectedAtom} onSelect={setSelectedAtom} /></group><ContactShadows position={[0, -1.5, 0]} opacity={.32} scale={10} blur={2.5} /><OrbitControls makeDefault minDistance={5} maxDistance={16} /></Canvas>;
+    <group rotation={[.08, -.25, 0]}>{showAtoms && residues.map(residue => <mesh key={residue.id} position={[residue.x, residue.y, residue.z]}><sphereGeometry args={[.22, 12, 10]} /><meshStandardMaterial color={residue.color} /></mesh>)}{!showAtoms && !surface && <><Line points={helixPoints} color="#6b9fe9" lineWidth={5} /> <Line points={sheetPoints} color="#d58acb" lineWidth={6} /></>}{surface && <ProteinSurface />}{residues.map(residue => <group key={`res-${residue.id}`} position={[residue.x, residue.y, residue.z]}><mesh onClick={(event) => { event.stopPropagation(); setSelectedResidue(residue.id); }}><sphereGeometry args={[selectedResidue === residue.id ? .28 : .18, 16, 12]} /><meshStandardMaterial color={residue.color} emissive={selectedResidue === residue.id ? residue.color : '#000'} emissiveIntensity={selectedResidue === residue.id ? .8 : 0} transparent opacity={surface ? .9 : 1} /></mesh><Text position={[0, .43, 0]} fontSize={.14} color={selectedResidue === residue.id ? '#ffe9a2' : '#8baeb9'} anchorX="center">{residue.code}</Text></group>)}<Ligand rotation={ligandRotation} selectedAtom={selectedAtom} onSelect={setSelectedAtom} /></group><ContactShadows position={[0, -1.5, 0]} opacity={.32} scale={10} blur={2.5} /><OrbitControls makeDefault minDistance={5} maxDistance={16} /></Canvas>;
 }
 function Metric({ label, value, note }: { label: string; value: string; note: string }) { return <div className="metric"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>; }
 export default function App() {
